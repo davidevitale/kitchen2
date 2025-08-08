@@ -1,10 +1,14 @@
-from pydantic import BaseModel, Field
+import uuid
 from datetime import datetime, timezone
+from pydantic import BaseModel, Field
 
 class Order(BaseModel):
-    order_id: str 
-    customer_id: str
-    kitchen_id: str
-    dish_id: str
+    """
+    Modello che contiene i dati primari di un ordine,
+    con la regola di un solo piatto per ordine.
+    """
+    order_id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    customer_id: uuid.UUID
+    dish_id: uuid.UUID
     delivery_address: str
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

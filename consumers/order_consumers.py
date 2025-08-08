@@ -1,56 +1,62 @@
-# consumers/order_consumer.py
-from aiokafka import AIOKafkaConsumer
 import asyncio
 import json
-from model.kitchen_availability import KitchenAvailability
+from aiokafka import AIOKafkaConsumer
+from aiokafka.errors import KafkaConnectionError
+from model import OrderRequest
+from service.avail_service import KitchenService
 
-class OrderConsumer:
-    def __init__(self, kafka_bootstrap_servers: str, menu_service, kitchen_service):
-        self.kafka_bootstrap_servers = kafka_bootstrap_servers
-        self.consumer = None
-        self.menu_service = menu_service
-        self.kitchen_service = kitchen_service
+# Nomi dei topic da cui ascoltare
+TOPICS = ["kitchen_availability_requests", "order_assignments", "order_status_requests"]
+
+class EventConsumer:
+    def __init__(self, service: KitchenService, host='localhost', port=9092):
+        self.service = service
+        self.consumer = AIOKafkaConsumer(
+            *TOPICS,
+            bootstrap_servers=f"{host}:{port}",
+            value_deserializer=lambda v: json.loads(v.decode('utf-8')),
+            group_id="kitchen_service_group",
+            auto_offset_reset="latest"
+        )
+        self._started = False
 
     async def start(self):
-        self.consumer = AIOKafkaConsumer(
-            "order.created", "order.status.updated", "kitchen.availability.updated",
-            bootstrap_servers=self.kafka_bootstrap_servers,
-            group_id="order_service_group"
-        )
-        await self.consumer.start()
-        try:
-            async for msg in self.consumer:
-                event = json.loads(msg.value.decode("utf-8"))
-                topic = msg.topic
-                await self.handle_event(topic, event)
-        finally:
+        # Logica di retry
+        if self._started: return
+        for i in range(10):
+            try:
+                await self.consumer.start()
+                self._started = True
+                print("✅ CONSUMER: Connesso a Kafka.")
+                return
+            except KafkaConnectionError:
+                print(f"⚠️ CONSUMER: Connessione a Kafka fallita (tentativo {i+1})...")
+                await asyncio.sleep(3)
+        print("❌ ERRORE CRITICO (Consumer): Impossibile connettersi a Kafka.")
+
+    async def stop(self):
+        if self._started:
             await self.consumer.stop()
+            print("🛑 CONSUMER: Disconnesso da Kafka.")
 
-    async def handle_event(self, topic: str, event: dict):
-        if topic == "order.created":
-            # logica per nuovo ordine
-            print(f"Ricevuto ordine: {event}")
-            # es. check disponibilità cucina
-            can_accept = self.kitchen_service.can_accept_order(event['kitchen_id'])
-            if can_accept:
-                self.kitchen_service.increase_capacity(event['kitchen_id'])
-                print(f"Ordine accettato per cucina {event['kitchen_id']}")
-            else:
-                print(f"Cucina non disponibile per ordine {event['order_id']}")
+    async def listen(self):
+        """Loop principale di ascolto."""
+        if not self._started: return
+        print(f"🎧 CONSUMER: In ascolto su topics: {', '.join(TOPICS)}")
+        async for msg in self.consumer:
+            print(f"📬 CONSUMER: Messaggio ricevuto su topic '{msg.topic}': {msg.value}")
+            try:
+                if msg.topic == "kitchen_availability_requests":
+                    request = OrderRequest(**msg.value)
+                    await self.service.check_availability(request)
+                
+                elif msg.topic == "order_assignments":
+                    order_id = msg.value['order_id']
+                    assigned_kitchen_id = msg.value['kitchen_id']
+                    await self.service.handle_order_assignment(order_id, assigned_kitchen_id)
 
-        elif topic == "order.status.updated":
-            # logica aggiornamento stato ordine
-            print(f"Aggiornamento stato ordine: {event}")
-            old_status = event.get("old_status")
-            new_status = event.get("new_status")
-            kitchen_id = event.get("kitchen_id")
-            if old_status != "pronto" and new_status == "pronto":
-                self.kitchen_service.decrease_capacity(kitchen_id)
-            elif old_status != "in preparazione" and new_status == "in preparazione":
-                self.kitchen_service.increase_capacity(kitchen_id)
-
-        elif topic == "kitchen.availability.updated":
-            # logica aggiornamento disponibilità cucina
-            print(f"Aggiornamento disponibilità cucina: {event}")
-            availability = KitchenAvailability(**event)
-            self.kitchen_service.set_availability(availability)
+                elif msg.topic == "order_status_requests":
+                    order_id = msg.value['order_id']
+                    await self.service.get_and_publish_order_status(order_id)
+            except Exception as e:
+                print(f"🔥 ERRORE durante l'elaborazione del messaggio: {e}")

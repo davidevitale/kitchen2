@@ -1,32 +1,36 @@
-from typing import Optional
-from uuid import UUID
-from model.menu_item import Menu, Dish
-from repository.menu_rep import MenuRepository
+import uuid
+from repository.menu_repository import MenuRepository
 
 class MenuService:
+    """
+    Contiene la logica di business per la gestione dell'inventario dei piatti.
+    """
     def __init__(self, menu_repo: MenuRepository):
-        self.menu_repo = menu_repo
+        self._menu_repo = menu_repo
 
-    def create_menu(self, menu: Menu):
-        """Crea un nuovo menu"""
-        self.menu_repo.save_menu(menu)
+    async def decrement_item_quantity(self, kitchen_id: uuid.UUID, dish_id: uuid.UUID) -> bool:
+        """
+        Decrementa la quantità disponibile di un piatto.
+        """
+        item = await self._menu_repo.get_menu_item(kitchen_id, dish_id)
+        if not item or item.available_quantity <= 0:
+            # LOG: Piatto non trovato o quantità esaurita.
+            return False
+        
+        item.available_quantity -= 1
+        
+        # Usiamo il metodo del repository che sovrascrive l'item.
+        await self._menu_repo.create_menu_item(kitchen_id, item)
+        return True
 
-    def get_menu(self, kitchen_id: UUID) -> Optional[Menu]:
-        """Recupera menu di una cucina"""
-        return self.menu_repo.get_menu(kitchen_id)
-
-    def update_menu(self, menu: Menu):
-        """Aggiorna menu esistente"""
-        self.menu_repo.save_menu(menu)
-
-    def delete_menu(self, kitchen_id: UUID):
-        """Elimina un menu"""
-        self.menu_repo.delete_menu(kitchen_id)
-
-    def update_dish_quantity(self, kitchen_id: UUID, dish_id: UUID, quantity: int):
-        """Aggiorna quantità disponibile di un piatto"""
-        self.menu_repo.update_dish_quantity(kitchen_id, dish_id, quantity)
-
-    def decrement_dish_quantity(self, kitchen_id: UUID, dish_id: UUID, quantity: int):
-        """Decrementa quantità dopo un ordine"""
-        self.menu_repo.decrement_dish_quantity(kitchen_id, dish_id, quantity)
+    async def increment_item_quantity(self, kitchen_id: uuid.UUID, dish_id: uuid.UUID) -> bool:
+        """
+        Incrementa la quantità di un piatto (utile se un ordine viene annullato).
+        """
+        item = await self._menu_repo.get_menu_item(kitchen_id, dish_id)
+        if not item:
+            return False
+            
+        item.available_quantity += 1
+        await self._menu_repo.create_menu_item(kitchen_id, item)
+        return True
