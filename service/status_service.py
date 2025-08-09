@@ -1,14 +1,18 @@
-# services/order_status_service.py
+# cartella: services/order_status_service.py
+
 import uuid
-from datetime import datetime, timezone
+import asyncio # <-- Importa la libreria asyncio
 from typing import Optional
+
+# Importa i tuoi modelli e il repository
 from model.order import Order
 from model.status import OrderStatus, StatusEnum
 from repository.order_status_repository import OrderStatusRepository
 
 class OrderStatusService:
     """
-    Servizio specializzato nella gestione CRUD dello stato degli ordini.
+    Servizio ASINCRONO specializzato nella gestione dello stato degli ordini.
+    Usa asyncio.to_thread per chiamare il repository sincrono in modo non bloccante.
     """
     def __init__(self, status_repo: OrderStatusRepository):
         self._status_repo = status_repo
@@ -23,16 +27,24 @@ class OrderStatusService:
             kitchen_id=order.kitchen_id,
             status=StatusEnum.RECEIVED
         )
-        await self._status_repo.save(status)
+        
+        # Eseguiamo la chiamata bloccante 'save' in un thread separato
+        await asyncio.to_thread(self._status_repo.save, status)
+        
+        print(f"INFO (StatusService): Stato iniziale creato per l'ordine {order.order_id}")
         return status
 
     async def update_status(self, order_id: uuid.UUID, new_status: StatusEnum) -> bool:
-        """Aggiorna lo stato di un ordine esistente."""
-        status_record = await self._status_repo.get_by_id(order_id)
-        if not status_record:
-            return False
+        """Aggiorna lo stato di un ordine esistente in modo sicuro e non bloccante."""
+        print(f"INFO (StatusService): Tentativo di aggiornare lo stato dell'ordine {order_id} a '{new_status.value}'...")
         
-        status_record.status = new_status
-        status_record.updated_at = datetime.now(timezone.utc)
-        await self._status_repo.save(status_record)
-        return True
+        # Eseguiamo la chiamata bloccante 'update_status' del repository in un thread separato.
+        # Questo libera l'event loop per gestire altre operazioni.
+        success = await asyncio.to_thread(self._status_repo.update_status, order_id, new_status)
+        
+        if success:
+            print(f"INFO (StatusService): Stato per l'ordine {order_id} aggiornato con successo.")
+        else:
+            print(f"ERROR (StatusService): Fallito l'aggiornamento dello stato per l'ordine {order_id}.")
+            
+        return success
