@@ -1,6 +1,6 @@
 import uuid
 from typing import Dict, Optional, List
-from model import KitchenAvailability
+from model.kitchen import KitchenAvailability
 
 class KitchenAvailabilityRepository:
     def __init__(self):

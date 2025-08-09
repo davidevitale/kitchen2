@@ -8,6 +8,7 @@ class Order(BaseModel):
     con la regola di un solo piatto per ordine.
     """
     order_id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    kitchen_id: uuid.UUID
     customer_id: uuid.UUID
     dish_id: uuid.UUID
     delivery_address: str
