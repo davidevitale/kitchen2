@@ -1,97 +1,247 @@
-# cartella: tests/api/test_api_main.py
-
-import unittest
+# ======================================================================
+# --- File: api/main.py (Protezione API Key per endpoint interni) ---
+# ======================================================================
+import os
 import uuid
-from unittest.mock import MagicMock, AsyncMock
+from fastapi import FastAPI, Depends, HTTPException, status, Header
+from pydantic import BaseModel
+from typing import List, Optional
+from redis.cluster import ClusterNode
 
-from fastapi.testclient import TestClient
+# Importa modelli, servizi e repository
+from model.menu import MenuItem
+from model.status import OrderStatus, StatusEnum
+from model.kitchen import KitchenAvailability
+from model.order import Order
+from model.messaging_models import OrderRequest
 
-# Importa l'app FastAPI e le funzioni "provider" dal tuo file API
-# Dobbiamo anche importare le classi di servizio per poterle "mockare"
-from api.api import app, get_orchestrator
+from service.kitchen_service import KitchenService
+from service.menu_service import MenuService
 from service.order_service import OrderOrchestrationService
-from model.status import StatusEnum
+from service.status_service import OrderStatusService
+
+from repository.kitchen_repository import KitchenAvailabilityRepository
+from repository.menu_repository import MenuRepository
+from repository.order_status_repository import OrderStatusRepository
+from repository.order_repository import OrderRepository
+
+from producers.producers import EventProducer
 
 # ======================================================================
-# --- Oggetti Finti (Mock) per i Servizi ---
+# --- Blocco di Inizializzazione e Dependency Injection ---
 # ======================================================================
 
-# Creiamo dei mock che verranno usati per sostituire i servizi reali
-mock_orchestrator = MagicMock(spec=OrderOrchestrationService)
-# Configuriamo i metodi asincroni del mock
-mock_orchestrator.handle_order_status_update = AsyncMock(return_value=True)
+KAFKA_BROKERS = "localhost:9092"
+ETCD_HOST = "localhost"
+ETCD_PORT = 2379
 
-# Sostituiamo il servizio reale con il nostro mock usando la dependency injection di FastAPI
-app.dependency_overrides[get_orchestrator] = lambda: mock_orchestrator
+try:
+    KITCHEN_ID = uuid.UUID(os.environ.get("KITCHEN_ID"))
+    print(f"✅ ID Cucina caricato dall'ambiente: {KITCHEN_ID}")
+except (ValueError, TypeError):
+    KITCHEN_ID = uuid.uuid4()
+    print(f"⚠️ ATTENZIONE: KITCHEN_ID non trovato. Generato un ID casuale: {KITCHEN_ID}")
+
+# Repositories
+kitchen_repo = KitchenAvailabilityRepository(host=ETCD_HOST, port=ETCD_PORT)
+redis_cluster_nodes = [
+    ClusterNode("redis-node-1", 6379),
+    ClusterNode("redis-node-2", 6379),
+    ClusterNode("redis-node-3", 6379)
+]
+menu_repo = MenuRepository(redis_cluster_nodes=redis_cluster_nodes)
+order_status_repo = OrderStatusRepository(host=ETCD_HOST, port=ETCD_PORT)
+order_repo = OrderRepository(host=ETCD_HOST, port=ETCD_PORT)
+
+# Producer Kafka
+event_producer = EventProducer(bootstrap_servers=KAFKA_BROKERS)
+
+# Services
+kitchen_service = KitchenService(kitchen_repo=kitchen_repo)
+menu_service = MenuService(menu_repo=menu_repo)
+status_service = OrderStatusService(status_repo=order_status_repo)
+orchestration_service = OrderOrchestrationService(
+    order_repo=order_repo,
+    kitchen_service=kitchen_service,
+    menu_service=menu_service,
+    status_service=status_service,
+    event_producer=event_producer
+)
+
+# Provider FastAPI
+def get_kitchen_service(): return kitchen_service
+def get_menu_service(): return menu_service
+def get_orchestrator(): return orchestration_service
+def get_status_service(): return status_service
 
 # ======================================================================
-# --- Suite di Test per l'API ---
+# --- FastAPI App ---
 # ======================================================================
 
-class TestKitchenApi(unittest.TestCase):
-    
-    def setUp(self):
-        # Il TestClient ci permette di inviare richieste HTTP alla nostra app
-        self.client = TestClient(app)
-        # Resettiamo i mock prima di ogni test per avere un ambiente pulito
-        mock_orchestrator.reset_mock()
+app = FastAPI(
+    title="Kitchen Service API",
+    description="API per gestire le operazioni di una Ghost Kitchen."
+)
 
-    def test_get_kitchen_status_endpoint(self):
-        """
-        TEST: Verifica che l'endpoint GET /kitchen funzioni.
-        Nota: Questo test è semplificato. In un caso reale, dovremmo mockare
-        anche il kitchen_repo per controllare la risposta.
-        """
-        # Per questo test, assumiamo che il kitchen_repo in-memory abbia dei dati.
-        # In un'app più complessa, useremmo dependency_overrides anche per i repo.
-        response = self.client.get("/kitchen")
-        
-        # ASSERT: Verifichiamo la risposta
-        self.assertEqual(response.status_code, 200)
-        data = response.json()
-        self.assertIn("kitchen_id", data)
-        self.assertIn("is_operational", data)
+# --- API Key per endpoint interni ---
+INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY", "changeme123")
 
-    def test_update_order_status_success(self):
-        """
-        TEST: Verifica che l'endpoint PATCH /orders/{order_id}/status chiami
-        correttamente il servizio di orchestrazione quando i dati sono validi.
-        """
-        # ARRANGE: Prepariamo i dati per il test
-        order_id = uuid.uuid4()
-        request_body = {"status": "ready"} # Deve corrispondere a StatusUpdateRequest
+async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
+    if x_api_key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden: Invalid API Key")
 
-        # ACT: Inviamo una richiesta PATCH finta al nostro endpoint
-        response = self.client.patch(f"/orders/{order_id}/status", json=request_body)
+# ======================================================================
+# --- Modelli request ---
+# ======================================================================
 
-        # ASSERT: Verifichiamo il risultato
-        # 1. La risposta HTTP deve essere corretta (202 Accepted)
-        self.assertEqual(response.status_code, 202)
-        self.assertEqual(response.json(), {"message": "Richiesta di aggiornamento stato accettata."})
+class QuantityUpdateRequest(BaseModel):
+    available_quantity: int
 
-        # 2. Il servizio di orchestrazione deve essere stato chiamato esattamente una volta
-        mock_orchestrator.handle_order_status_update.assert_called_once()
-        
-        # 3. Verifichiamo che sia stato chiamato con i parametri giusti
-        call_args = mock_orchestrator.handle_order_status_update.call_args
-        self.assertEqual(call_args.kwargs['order_id'], order_id)
-        self.assertEqual(call_args.kwargs['new_status'], StatusEnum.READY)
+class StatusUpdateRequest(BaseModel):
+    status: StatusEnum
 
-    def test_update_order_status_not_found(self):
-        """
-        TEST: Verifica che l'API restituisca un errore 404 se il servizio
-        segnala che l'ordine non è stato trovato.
-        """
-        # ARRANGE
-        order_id = uuid.uuid4()
-        request_body = {"status": "delivered"}
-        
-        # Diciamo al nostro mock di simulare un fallimento
-        mock_orchestrator.handle_order_status_update.return_value = False
+class MenuItemUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    price: Optional[float] = None
+    available_quantity: Optional[int] = None
 
-        # ACT
-        response = self.client.patch(f"/orders/{order_id}/status", json=request_body)
+# ======================================================================
+# --- Kitchen Endpoints ---
+# ======================================================================
 
-        # ASSERT
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.json(), {"detail": "Ordine non trovato o aggiornamento fallito."})
+@app.get("/kitchen", response_model=KitchenAvailability)
+async def get_kitchen_status(kitchen_service: KitchenService = Depends(get_kitchen_service)):
+    kitchen_state = await kitchen_service.get_by_id(KITCHEN_ID)
+    if not kitchen_state:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stato cucina non trovato.")
+    return kitchen_state
+
+@app.patch("/kitchen", dependencies=[Depends(verify_api_key)])
+async def update_kitchen_status(
+    is_operational: bool,
+    kitchen_service: KitchenService = Depends(get_kitchen_service)
+):
+    success = await kitchen_service.set_operational_status(KITCHEN_ID, is_operational)
+    if not success:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Impossibile aggiornare lo stato della cucina.")
+    return {"message": "Stato cucina aggiornato con successo."}
+
+# ======================================================================
+# --- Menu Endpoints ---
+# ======================================================================
+
+@app.get("/menu/dishes", response_model=List[MenuItem])
+async def get_all_dishes(menu_service: MenuService = Depends(get_menu_service)):
+    menu = await menu_service.get_menu(KITCHEN_ID)
+    return menu.items if menu and menu.items else []
+
+@app.get("/menu/dishes/{dish_id}", response_model=MenuItem)
+async def get_dish_detail(dish_id: uuid.UUID, menu_service: MenuService = Depends(get_menu_service)):
+    item = await menu_service.get_menu_item(KITCHEN_ID, dish_id)
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Piatto non trovato.")
+    return item
+
+@app.post("/menu/dishes", status_code=status.HTTP_201_CREATED, response_model=MenuItem, dependencies=[Depends(verify_api_key)])
+async def create_menu_item(dish: MenuItem, menu_service: MenuService = Depends(get_menu_service)):
+    success = await menu_service.create_menu_item(KITCHEN_ID, dish)
+    if not success:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Creazione piatto fallita.")
+    return dish
+
+@app.patch("/menu/dishes/{dish_id}/quantity", response_model=MenuItem, dependencies=[Depends(verify_api_key)])
+async def update_dish_quantity(
+    dish_id: uuid.UUID,
+    request: QuantityUpdateRequest,
+    menu_service: MenuService = Depends(get_menu_service)
+):
+    item = await menu_service.get_menu_item(KITCHEN_ID, dish_id)
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Piatto non trovato.")
+    item.available_quantity = request.available_quantity
+    await menu_service.update_menu_item(KITCHEN_ID, item)
+    return item
+
+@app.patch("/menu/dishes/{dish_id}", response_model=MenuItem, dependencies=[Depends(verify_api_key)])
+async def update_menu_item(
+    dish_id: uuid.UUID,
+    request: MenuItemUpdateRequest,
+    menu_service: MenuService = Depends(get_menu_service)
+):
+    """Aggiorna più campi di un piatto: nome, descrizione, prezzo, quantità."""
+    item = await menu_service.get_menu_item(KITCHEN_ID, dish_id)
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Piatto non trovato.")
+
+    if request.name is not None:
+        item.name = request.name
+    if request.description is not None:
+        item.description = request.description
+    if request.price is not None:
+        item.price = request.price
+    if request.available_quantity is not None:
+        item.available_quantity = request.available_quantity
+
+    await menu_service.update_menu_item(KITCHEN_ID, item)
+    return item
+
+@app.delete("/menu/dishes/{dish_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(verify_api_key)])
+async def delete_menu_item(dish_id: uuid.UUID, menu_service: MenuService = Depends(get_menu_service)):
+    success = await menu_service.delete_menu_item(KITCHEN_ID, dish_id)
+    if not success:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Piatto non trovato o impossibile eliminare.")
+    return {"message": "Piatto eliminato con successo."}
+
+# ======================================================================
+# --- Orders Endpoints ---
+# ======================================================================
+
+@app.get("/orders", response_model=List[OrderStatus])
+async def get_active_orders(status_service: OrderStatusService = Depends(get_status_service)):
+    return await status_service.get_all_active_orders_by_kitchen(KITCHEN_ID)
+
+@app.get("/orders/{order_id}", response_model=Order)
+async def get_order_detail(order_id: uuid.UUID, orchestrator: OrderOrchestrationService = Depends(get_orchestrator)):
+    order = await orchestrator.get_order_by_id(order_id)
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ordine non trovato.")
+    return order
+
+@app.post("/user/orders", status_code=201, response_model=Order)
+async def create_user_order(order_request: OrderRequest, orchestrator: OrderOrchestrationService = Depends(get_orchestrator)):
+    """
+    Endpoint per il cliente finale per fare un ordine.
+    Internamente chiama `check_availability_and_propose` e gestisce il flusso.
+    """
+    # L’orchestrator gestisce tutto il flusso (proposta -> assegnazione -> salvataggio)
+    saved_order = await orchestrator.create_order_from_user(order_request)
+    if not saved_order:
+        raise HTTPException(status_code=500, detail="Ordine non creato.")
+    return saved_order
+
+@app.post("/orders", status_code=status.HTTP_201_CREATED, response_model=Order, dependencies=[Depends(verify_api_key)])
+async def create_order(order: Order, orchestrator: OrderOrchestrationService = Depends(get_orchestrator)):
+    success = await orchestrator.handle_newly_assigned_order(order)
+    if not success:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Creazione ordine fallita.")
+    saved_order = await orchestrator.get_order_by_id(order.order_id)
+    if not saved_order:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Ordine creato ma non recuperabile.")
+    return saved_order
+
+@app.post("/orders/proposals", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(verify_api_key)])
+async def propose_order(request: OrderRequest, orchestrator: OrderOrchestrationService = Depends(get_orchestrator)):
+    await orchestrator.check_availability_and_propose(request)
+    return {"message": "Richiesta di candidatura inviata alle cucine."}
+
+@app.patch("/orders/{order_id}/status", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(verify_api_key)])
+async def update_order_status(
+    order_id: uuid.UUID,
+    request: StatusUpdateRequest,
+    orchestrator: OrderOrchestrationService = Depends(get_orchestrator)
+):
+    success = await orchestrator.handle_order_status_update(order_id, request.status)
+    if not success:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ordine non trovato o aggiornamento fallito.")
+    return {"message": "Richiesta di aggiornamento stato accettata."}
